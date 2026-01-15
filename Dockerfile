@@ -12,7 +12,10 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 # Enables env file
-ENV APP_ENV=development
+ENV APP_ENV=production
+
+#add pypi mirror to config
+COPY pip.conf /etc/xdg/pip/pip.conf
 
 # Install pip requirements
 COPY requirements.txt .
@@ -23,4 +26,4 @@ WORKDIR /app
 COPY . /app
 
 # During debugging, this entry point will be overridden. For more information, please refer to https://aka.ms/vscode-docker-python-debug
-CMD ["gunicorn", "--bind", "0.0.0.0:80", "-k", "uvicorn.workers.UvicornWorker", "--workers", "2", "app.main:app"]
+CMD ["sh", "-c", "gunicorn  --bind 0.0.0.0:80 -k uvicorn.workers.UvicornWorker --workers 1 --timeout 600 app.main:app"]

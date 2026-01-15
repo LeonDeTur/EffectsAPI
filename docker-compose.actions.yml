@@ -1,0 +1,12 @@
+services:
+  object_effects:
+    image: ${IMAGE}
+    container_name: ${CONTAINER_NAME}
+    ports:
+      - 5100:80
+    volumes:
+      - /var/essdata/effects/__effects_cache__:/app/__effects_cache__
+    env_file:
+      - .env.development
+    restart: always
+

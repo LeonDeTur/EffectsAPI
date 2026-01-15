@@ -1,0 +1,1993 @@
+import asyncio
+import json
+import math
+import re
+import time
+from pathlib import Path
+from typing import Any, Dict, Literal
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+from blocksnet.analysis.indicators import calculate_development_indicators
+from blocksnet.analysis.indicators.socio_economic import (
+    calculate_demographic_indicators,
+    calculate_engineering_indicators,
+    calculate_general_indicators,
+    calculate_social_indicators,
+    calculate_transport_indicators,
+)
+from blocksnet.analysis.land_use.prediction import SpatialClassifier
+from blocksnet.analysis.provision import competitive_provision, provision_strong_total
+from blocksnet.blocks.assignment import assign_objects
+from blocksnet.config import service_types_config
+from blocksnet.enums import LandUse
+from blocksnet.machine_learning.regression import DensityRegressor
+from blocksnet.optimization.services import (
+    AreaSolution,
+    Facade,
+    GradientChooser,
+    TPEOptimizer,
+    WeightedConstraints,
+    WeightedObjective,
+)
+from blocksnet.relations import (
+    calculate_distance_matrix,
+    generate_adjacency_graph,
+)
+from catboost import CatBoostRegressor
+from loguru import logger
+from urbanomy.methods.investment_potential import InvestmentAttractivenessAnalyzer
+from urbanomy.methods.land_value_modeling import LandDataPreparator, LandPriceEstimator
+from urbanomy.methods.socio_economic_indicators.sei_calculate import SEREstimator
+from urbanomy.utils.investment_input import prepare_investment_input
+
+from app.effects_api.modules.scenario_service import ScenarioService
+from app.effects_api.modules.service_type_service import (
+    adapt_service_types,
+    build_en_to_ru_map,
+    ensure_missing_id_and_name_columns,
+    generate_blocksnet_columns,
+)
+
+from ..clients.urban_api_client import UrbanAPIClient
+from ..common.caching.caching_service import FileCache
+from ..common.exceptions.http_exception_wrapper import http_exception
+from ..common.utils.effects_utils import EffectsUtils
+from ..common.utils.geodata import (
+    _ensure_block_index,
+    fc_to_gdf,
+    gdf_to_ru_fc_rounded,
+    get_accessibility_matrix,
+    is_fc,
+    round_coords,
+)
+from .constants.const import (
+    INDICATORS_MAPPING,
+    INFRASTRUCTURES_WEIGHTS,
+    MAX_EVALS,
+    MAX_RUNS,
+    PRED_VALUE_RU,
+    PROB_COLS_EN_TO_RU,
+    ROADS_ID, URBANOMY_LAND_USE_RULES, benchmarks_demo, URBANOMY_INDICATORS_MAPPING, URBANOMY_BLOCK_COLS,
+)
+from .dto.development_dto import (
+    ContextDevelopmentDTO,
+    DevelopmentDTO,
+)
+from .dto.socio_economic_project_dto import (
+    SocioEconomicByProjectDTO,
+)
+from .dto.transformation_effects_dto import TerritoryTransformationDTO
+from .modules.context_service import ContextService
+from ..prometheus.metrics import (
+    EFFECTS_TERRITORY_TRANSFORMATION_TOTAL,
+    EFFECTS_TERRITORY_TRANSFORMATION_ERROR_TOTAL,
+    EFFECTS_TERRITORY_TRANSFORMATION_DURATION_SECONDS,
+    EFFECTS_VALUES_TRANSFORMATION_TOTAL,
+    EFFECTS_VALUES_TRANSFORMATION_ERROR_TOTAL,
+    EFFECTS_VALUES_TRANSFORMATION_DURATION_SECONDS,
+    EFFECTS_VALUES_ORIENTED_REQUIREMENTS_TOTAL,
+    EFFECTS_VALUES_ORIENTED_REQUIREMENTS_ERROR_TOTAL,
+    EFFECTS_VALUES_ORIENTED_REQUIREMENTS_DURATION_SECONDS,
+    EFFECTS_SOCIO_ECONOMICAL_METRICS_TOTAL,
+    EFFECTS_SOCIO_ECONOMICAL_METRICS_ERROR_TOTAL,
+    EFFECTS_SOCIO_ECONOMICAL_METRICS_DURATION_SECONDS)
+
+
+class EffectsService:
+    def __init__(
+        self,
+        urban_api_client: UrbanAPIClient,
+        cache: FileCache,
+        scenario_service: ScenarioService,
+        context_service: ContextService,
+        effects_utils: EffectsUtils,
+        _land_price_model_lock: asyncio.Lock | None = None,
+        _indicator_name_cache: dict[int, str] | None = None,
+        _indicator_name_cache_lock: asyncio.Lock | None = None,
+        _land_price_model: CatBoostRegressor | None = None,
+        _catboost_model_path: str = "./catboost_model.cbm",
+        _urbanomy_indicator_name_cache: dict[int, str] | None = None,
+        _urbanomy_indicator_name_cache_lock: asyncio.Lock | None = None,
+    ):
+        self._land_price_model = _land_price_model
+        self._land_price_model_lock = _land_price_model_lock or asyncio.Lock()
+
+        self._indicator_name_cache = _indicator_name_cache or {}
+        self._indicator_name_cache_lock = _indicator_name_cache_lock or asyncio.Lock()
+
+        self._urbanomy_indicator_name_cache = _urbanomy_indicator_name_cache or {}
+        self._urbanomy_indicator_name_cache_lock = _urbanomy_indicator_name_cache_lock or asyncio.Lock()
+
+        self._catboost_model_path = _catboost_model_path
+
+        self.urban_api_client = urban_api_client
+        self.cache = cache
+        self.scenario = scenario_service
+        self.context = context_service
+        self.effects_utils = effects_utils
+        self.__name__ = "EffectsService"
+
+    async def build_hash_params(
+        self,
+        params: ContextDevelopmentDTO | DevelopmentDTO,
+        token: str,
+    ) -> dict:
+        project_id = (
+            await self.urban_api_client.get_scenario_info(params.scenario_id, token)
+        )["project"]["project_id"]
+        base_scenario_id = await self.urban_api_client.get_base_scenario_id(project_id, token)
+        base_src, base_year = (
+            await self.urban_api_client.get_optimal_func_zone_request_data(
+                token, base_scenario_id, None, None
+            )
+        )
+        p = params.model_dump()
+        p.pop("force", None)
+        return p | {
+            "base_func_zone_source": base_src,
+            "base_func_zone_year": base_year,
+        }
+
+    async def get_optimal_func_zone_data(
+        self,
+        params: (
+            DevelopmentDTO
+            | ContextDevelopmentDTO
+            | SocioEconomicByProjectDTO
+            | TerritoryTransformationDTO
+        ),
+        token: str,
+    ) -> DevelopmentDTO:
+        """
+        Get optimal functional zone source and year for the project scenario.
+        If not provided, fetches the best available source and year.
+
+        Params:
+            params (DevelopmentDTO): DTO with scenario ID and optional
+        Returns:
+            DevelopmentDTO: DTO with updated functional zone source and year.
+        """
+
+        if not params.proj_func_zone_source or not params.proj_func_source_year:
+            (params.proj_func_zone_source, params.proj_func_source_year) = (
+                await self.urban_api_client.get_optimal_func_zone_request_data(
+                    token,
+                    params.scenario_id,
+                    params.proj_func_zone_source,
+                    params.proj_func_source_year,
+                )
+            )
+            if isinstance(params, ContextDevelopmentDTO):
+                if (
+                    not params.context_func_zone_source
+                    or not params.context_func_source_year
+                ):
+                    (
+                        params.context_func_zone_source,
+                        params.context_func_source_year,
+                    ) = await self.urban_api_client.get_optimal_func_zone_request_data(
+                        token,
+                        params.scenario_id,
+                        params.context_func_zone_source,
+                        params.context_func_source_year,
+                        project=False,
+                    )
+            return params
+        return params
+
+    async def _assess_provision(
+        self, blocks: pd.DataFrame, acc_mx: pd.DataFrame, service_type: str
+    ) -> gpd.GeoDataFrame:
+        _, demand, accessibility = service_types_config[service_type].values()
+        blocks["is_project"] = blocks["is_project"].fillna(False).astype(bool)
+        context_ids = await self.context.get_accessibility_context(
+            blocks, acc_mx, accessibility
+        )
+        capacity_column = f"capacity_{service_type}"
+        if capacity_column in blocks.columns:
+            blocks_df = (
+                blocks[["geometry", "population", capacity_column]]
+                .rename(columns={capacity_column: "capacity"})
+                .fillna(0)
+            )
+        else:
+            blocks_df = blocks[["geometry", "population"]].copy().fillna(0)
+            blocks_df["capacity"] = 0
+        prov_df, _ = competitive_provision(blocks_df, acc_mx, accessibility, demand)
+        prov_df = prov_df.loc[context_ids].copy()
+        return blocks[["geometry"]].join(prov_df, how="right")
+
+    async def calculate_provision_totals(
+        self,
+        provision_gdfs_dict: dict[str, gpd.GeoDataFrame],
+        ndigits: int = 2,
+    ) -> dict[str, float | None]:
+        prov_totals: dict[str, float | None] = {}
+        for st_name, prov_gdf in provision_gdfs_dict.items():
+            if prov_gdf.demand.sum() == 0:
+                prov_totals[st_name] = None
+            else:
+                try:
+                    total = float(provision_strong_total(prov_gdf))
+                except Exception as e:
+                    logger.exception("Provision total calculation failed")
+                    raise http_exception(
+                        500,
+                        "Provision total calculation failed",
+                        _input={"service_type": st_name},
+                        _detail=str(e),
+                    )
+                prov_totals[st_name] = round(total, ndigits)
+        return prov_totals
+
+    async def _compute_provision_layers(
+        self,
+        blocks: gpd.GeoDataFrame,
+        service_types: pd.DataFrame,
+        *,
+        section_label: str,
+    ) -> tuple[dict[str, gpd.GeoDataFrame], dict[str, float | None]]:
+        """Compute provision layers (GeoDataFrames) and totals for a blocks layer.
+
+        Args:
+            blocks: Blocks GeoDataFrame (must include 'geometry' and 'population').
+            service_types: Service types dataframe filtered to infrastructure services.
+            section_label: Human-readable label for logging (e.g. 'BEFORE', 'AFTER').
+
+        Returns:
+            Tuple of:
+                - dict[service_name, GeoDataFrame] with provision columns
+                - dict[service_name, total_provision] where total_provision may be None
+        """
+        blocks = blocks.copy()
+
+        if "is_project" in blocks.columns:
+            blocks["is_project"] = (
+                blocks["is_project"]
+                .infer_objects(copy=False)
+                .fillna(False)
+                .astype(bool)
+            )
+        else:
+            blocks["is_project"] = False
+
+        try:
+            acc_mx = get_accessibility_matrix(blocks)
+        except Exception as exc:
+            logger.exception(
+                f"Accessibility matrix calculation failed ({section_label}): {exc}"
+            )
+            raise http_exception(
+                500, "Accessibility matrix calculation failed", _detail=str(exc)
+            )
+
+        prov_gdfs: dict[str, gpd.GeoDataFrame] = {}
+
+        for st_id in service_types.index:
+            st_name = service_types.loc[st_id, "name"]
+            prov_gdf = await self._assess_provision(blocks, acc_mx, st_name)
+            prov_gdf = prov_gdf.join(
+                blocks[["is_project"]].reindex(prov_gdf.index), how="left"
+            )
+            prov_gdf["is_project"] = prov_gdf["is_project"].fillna(False).astype(bool)
+            prov_gdf = prov_gdf.to_crs(4326).drop(
+                columns="provision_weak", errors="ignore"
+            )
+
+            num_cols = [
+                c for c in prov_gdf.select_dtypes(include=["number"]).columns
+                if c != "is_project"
+            ]
+            if num_cols:
+                prov_gdf[num_cols] = prov_gdf[num_cols].fillna(0)
+
+            prov_gdfs[st_name] = gpd.GeoDataFrame(
+                prov_gdf, geometry="geometry", crs="EPSG:4326"
+            )
+
+        prov_totals = await self.calculate_provision_totals(prov_gdfs)
+        logger.info(
+            f"Provision layers computed ({section_label}): services={len(prov_gdfs)}"
+        )
+        return prov_gdfs, prov_totals
+
+
+    async def territory_transformation_scenario_before(
+            self,
+            token: str,
+            params: ContextDevelopmentDTO,
+            context_blocks: gpd.GeoDataFrame | None = None,
+    ):
+        """Compute and cache provision layers for territory transformation.
+
+        Semantics:
+            - 'before' is always computed for the *base* scenario of the project.
+            - 'after' is computed for the requested scenario_id (only for non-base scenarios).
+
+        Cache:
+            Stored under method 'territory_transformation' in a single JSON with sections:
+                data.before.{service_name, ..., provision_total_before}
+                data.after.{service_name, ..., provision_total_after}  (only for non-base)
+
+        Returns:
+            - For base scenarios: dict[str, GeoDataFrame] (only BEFORE layers)
+            - For non-base scenarios: {"before": {...}, "after": {...}}
+        """
+
+        method_name = "territory_transformation"
+
+        info = await self.urban_api_client.get_scenario_info(params.scenario_id, token)
+        updated_at = info["updated_at"]
+        is_based = bool(info.get("is_based"))
+        project_id = info["project"]["project_id"]
+        base_id_response = await self.urban_api_client.get_all_project_info(project_id, token)
+        base_scenario_id = base_id_response["base_scenario"]["id"]
+
+        params = await self.get_optimal_func_zone_data(params, token)
+        params_for_hash = await self.build_hash_params(params, token)
+        phash = self.cache.params_hash(params_for_hash)
+
+        force = bool(getattr(params, "force", False))
+        cached = None if force else self.cache.load(method_name, params.scenario_id, phash)
+
+        if cached and cached.get("meta", {}).get("scenario_updated_at") == updated_at:
+            data = cached.get("data") or {}
+            has_before = isinstance(data.get("before"), dict) and any(
+                is_fc(v) for v in (data.get("before") or {}).values()
+            )
+            has_after = isinstance(data.get("after"), dict) and any(
+                is_fc(v) for v in (data.get("after") or {}).values()
+            )
+
+            if has_before and (is_based or has_after):
+                before_gdfs = {
+                    n: fc_to_gdf(fc)
+                    for n, fc in (data.get("before") or {}).items()
+                    if is_fc(fc)
+                }
+                if is_based:
+                    return before_gdfs
+
+                after_gdfs = {
+                    n: fc_to_gdf(fc)
+                    for n, fc in (data.get("after") or {}).items()
+                    if is_fc(fc)
+                }
+                return {"before": before_gdfs, "after": after_gdfs}
+
+        logger.info("Cache stale, missing or forced: calculating TERRITORY_TRANSFORMATION provisions")
+
+        service_types = await self.urban_api_client.get_service_types()
+        service_types = await adapt_service_types(service_types, self.urban_api_client)
+        service_types = service_types[~service_types["infrastructure_type"].isna()].copy()
+
+        base_src, base_year = await self.urban_api_client.get_optimal_func_zone_request_data(
+            token, base_scenario_id, None, None
+        )
+        base_scenario_blocks, _ = await self.scenario.aggregate_blocks_layer_scenario(
+            base_scenario_id, base_src, base_year, token
+        )
+
+        if context_blocks is None:
+            context_blocks = gpd.GeoDataFrame(geometry=[], crs=base_scenario_blocks.crs)
+
+        before_blocks = pd.concat([context_blocks, base_scenario_blocks]).reset_index(
+            drop=True
+        )
+
+        prov_gdfs_before, prov_totals_before = await self._compute_provision_layers(
+            before_blocks,
+            service_types=service_types,
+            section_label="BEFORE",
+        )
+
+        existing_data = (cached.get("data") if cached else {}) or {}
+
+        existing_data["before"] = {
+            name: await gdf_to_ru_fc_rounded(gdf, ndigits=6)
+            for name, gdf in prov_gdfs_before.items()
+        }
+        existing_data["before"]["provision_total_before"] = prov_totals_before
+
+        prov_gdfs_after: dict[str, gpd.GeoDataFrame] = {}
+        prov_totals_after: dict[str, float | None] = {}
+
+        if not is_based:
+            scenario_blocks, _ = await self.scenario.aggregate_blocks_layer_scenario(
+                params.scenario_id,
+                params.proj_func_zone_source,
+                params.proj_func_source_year,
+                token,
+            )
+
+            after_blocks = pd.concat([context_blocks, scenario_blocks]).reset_index(
+                drop=True
+            )
+
+            if (
+                    "population" not in after_blocks.columns
+                    or after_blocks["population"].isna().any()
+            ):
+                dev_df = await self.run_development_parameters(after_blocks)
+                after_blocks["population"] = pd.to_numeric(
+                    dev_df["population"], errors="coerce"
+                ).fillna(0)
+            else:
+                after_blocks["population"] = pd.to_numeric(
+                    after_blocks["population"], errors="coerce"
+                ).fillna(0)
+
+            prov_gdfs_after, prov_totals_after = await self._compute_provision_layers(
+                after_blocks,
+                service_types=service_types,
+                section_label="AFTER",
+            )
+
+            existing_data["after"] = {
+                name: await gdf_to_ru_fc_rounded(gdf, ndigits=6)
+                for name, gdf in prov_gdfs_after.items()
+            }
+            existing_data["after"]["provision_total_after"] = prov_totals_after
+
+        self.cache.save(
+            method_name,
+            params.scenario_id,
+            params_for_hash,
+            existing_data,
+            scenario_updated_at=updated_at,
+        )
+
+        if is_based:
+            return prov_gdfs_before
+
+        return {"before": prov_gdfs_before, "after": prov_gdfs_after}
+
+    @staticmethod
+    async def run_development_parameters(
+        blocks_gdf: gpd.GeoDataFrame,
+    ) -> pd.DataFrame:
+        """
+        Compute core *development* indicators (FSI, GSI, MXI, etc.) for each
+        block and derive population estimates.
+
+        The routine:
+        1. Clips every land-use share to [0, 1].
+        2. Generates an adjacency graph (10 m tolerance).
+        3. Uses DensityRegressor to predict density indices.
+        4. Converts indices into built-area, footprint, living area, etc.
+        5. Estimates population by living_area // 20.
+
+        Params:
+        blocks_gdf : gpd.GeoDataFrame
+            Block layer already containing per-land-use **shares**
+            (0 ≤ share ≤ 1) and `site_area`.
+
+        Returns:
+        pd.DataFrame with added columns:
+            `build_floor_area`, `footprint_area`, `living_area`,
+            `non_living_area`, `population`, plus the original density indices.
+        """
+        for lu in LandUse:
+            blocks_gdf[lu.value] = blocks_gdf[lu.value].apply(lambda v: min(v, 1))
+
+        try:
+            adjacency_graph = generate_adjacency_graph(blocks_gdf, 10)
+        except Exception as e:
+            logger.exception("Adjacency graph generation failed")
+            raise http_exception(
+                500, "Adjacency graph generation failed", _detail=str(e)
+            )
+
+        dr = DensityRegressor()
+
+        try:
+            density_df = dr.evaluate(blocks_gdf, adjacency_graph)
+        except Exception as e:
+            logger.exception("Density evaluation failed")
+            raise http_exception(500, "Density evaluation failed", _detail=str(e))
+
+        density_df.loc[density_df["fsi"] < 0, "fsi"] = 0
+
+        density_df.loc[density_df["gsi"] < 0, "gsi"] = 0
+        density_df.loc[density_df["gsi"] > 1, "gsi"] = 1
+
+        density_df.loc[density_df["mxi"] < 0, "mxi"] = 0
+        density_df.loc[density_df["mxi"] > 1, "mxi"] = 1
+
+        density_df.loc[blocks_gdf["residential"] == 0, "mxi"] = 0
+        density_df["site_area"] = blocks_gdf["site_area"]
+
+        try:
+            development_df = calculate_development_indicators(density_df)
+        except Exception as e:
+            logger.exception("Development indicator calculation failed")
+            raise http_exception(
+                500, "Development indicator calculation failed", _detail=str(e)
+            )
+
+        development_df["population"] = development_df["living_area"] // 20
+
+        return development_df
+
+    def _build_facade(
+        self,
+        after_blocks: gpd.GeoDataFrame,
+        acc_mx: pd.DataFrame,
+        service_types: pd.DataFrame,
+    ) -> Facade:
+        blocks_lus = after_blocks.loc[after_blocks["is_project"], "land_use"]
+        blocks_lus = blocks_lus[~blocks_lus.isna()].to_dict()
+
+        var_adapter = AreaSolution(blocks_lus)
+
+        facade = Facade(
+            blocks_lu=blocks_lus,
+            blocks_df=after_blocks,
+            accessibility_matrix=acc_mx,
+            var_adapter=var_adapter,
+        )
+
+        for st_id, row in service_types.iterrows():
+            st_name = row["name"]
+            st_weight = row["infrastructure_weight"]
+            st_column = f"capacity_{st_name}"
+
+            if st_column in after_blocks.columns:
+                df = after_blocks.rename(columns={st_column: "capacity"})[
+                    ["capacity"]
+                ].fillna(0)
+            else:
+                df = after_blocks[[]].copy()
+                df["capacity"] = 0
+            facade.add_service_type(st_name, st_weight, df)
+
+        return facade
+
+    async def territory_transformation_scenario_after(
+            self,
+            token: str,
+            params: ContextDevelopmentDTO | DevelopmentDTO,
+            context_blocks: gpd.GeoDataFrame,
+            save_cache: bool = True,
+    ) -> dict[str, Any]:
+        """Compute and (optionally) cache optimization result for values transformation.
+
+        This method no longer persists provision layers. It is only responsible for
+        producing `best_x` (service placement optimization vector) which is later
+        used by `values_transformation`.
+
+        Cache:
+            Stored under method 'territory_transformation_opt' with payload: {"best_x": best_x}
+
+        Returns:
+            {"best_x": best_x}
+        """
+
+        opt_method = "territory_transformation_opt"
+
+        info = await self.urban_api_client.get_scenario_info(params.scenario_id, token)
+        updated_at = info["updated_at"]
+        is_based = bool(info.get("is_based"))
+
+        if is_based:
+            logger.exception("Base scenario has no optimization 'after' context")
+            raise http_exception(
+                400, "Base scenario has no optimization 'after' context"
+            )
+
+        params = await self.get_optimal_func_zone_data(params, token)
+        params_for_hash = await self.build_hash_params(params, token)
+        phash = self.cache.params_hash(params_for_hash)
+
+        force = bool(getattr(params, "force", False))
+        cached = None if force else self.cache.load(opt_method, params.scenario_id, phash)
+
+        if (
+                cached
+                and cached.get("meta", {}).get("scenario_updated_at") == updated_at
+                and isinstance(cached.get("data"), dict)
+                and "best_x" in cached["data"]
+        ):
+            return {"best_x": cached["data"]["best_x"]}
+
+        logger.info("Cache stale, missing or forced: running service placement optimization")
+
+        service_types = await self.urban_api_client.get_service_types()
+        service_types = await adapt_service_types(service_types, self.urban_api_client)
+        service_types = service_types[~service_types["infrastructure_type"].isna()].copy()
+
+        scenario_blocks, _ = await self.scenario.aggregate_blocks_layer_scenario(
+            params.scenario_id,
+            params.proj_func_zone_source,
+            params.proj_func_source_year,
+            token,
+        )
+
+        after_blocks = pd.concat([context_blocks, scenario_blocks]).reset_index(drop=True)
+
+        if "is_project" in after_blocks.columns:
+            after_blocks["is_project"] = (
+                after_blocks["is_project"].infer_objects(copy=False).fillna(False).astype(bool)
+            )
+        else:
+            after_blocks["is_project"] = False
+
+        try:
+            acc_mx = get_accessibility_matrix(after_blocks)
+        except Exception as exc:
+            logger.exception("Accessibility matrix calculation failed")
+            raise http_exception(500, "Accessibility matrix calculation failed", _detail=str(exc))
+
+        service_types["infrastructure_weight"] = (
+                service_types["infrastructure_type"].map(INFRASTRUCTURES_WEIGHTS)
+                * service_types["infrastructure_weight"]
+        )
+
+        if (
+                "population" not in after_blocks.columns
+                or after_blocks["population"].isna().any()
+        ):
+            dev_df = await self.run_development_parameters(after_blocks)
+            after_blocks["population"] = pd.to_numeric(
+                dev_df["population"], errors="coerce"
+            ).fillna(0)
+        else:
+            after_blocks["population"] = pd.to_numeric(
+                after_blocks["population"], errors="coerce"
+            ).fillna(0)
+
+        facade = self._build_facade(after_blocks, acc_mx, service_types)
+
+        services_weights = service_types.set_index("name")["infrastructure_weight"].to_dict()
+
+        objective = WeightedObjective(
+            num_params=facade.num_params,
+            facade=facade,
+            weights=services_weights,
+            max_evals=MAX_EVALS,
+        )
+        constraints = WeightedConstraints(num_params=facade.num_params, facade=facade)
+        tpe_optimizer = TPEOptimizer(
+            objective=objective,
+            constraints=constraints,
+            vars_chooser=GradientChooser(facade, facade.num_params, num_top=5),
+        )
+
+        try:
+            best_x, best_val, perc, func_evals = tpe_optimizer.run(
+                max_runs=MAX_RUNS, timeout=10, initial_runs_num=1
+            )
+        except Exception as e:
+            logger.exception("Optimization (TPE) failed")
+            raise http_exception(
+                500, "Service placement optimization failed", _detail=str(e)
+            )
+
+        if save_cache:
+            self.cache.save(
+                opt_method,
+                params.scenario_id,
+                params_for_hash,
+                {"best_x": best_x},
+                scenario_updated_at=updated_at,
+            )
+
+        return {"best_x": best_x}
+
+    async def territory_transformation(
+            self,
+            token: str,
+            params: ContextDevelopmentDTO,
+    ) -> dict[str, Any] | dict[str, dict[str, Any]]:
+        """Compute territory transformation provision layers.
+
+        NOTE:
+            Provision layers for both 'before' (base scenario) and 'after' (requested scenario)
+            are computed inside `territory_transformation_scenario_before`. The 'after' section
+            is omitted for base scenarios.
+        """
+        project_id = (
+            await self.urban_api_client.get_scenario_info(params.scenario_id, token)
+        )["project"]["project_id"]
+
+        # context_blocks, context_territories_gdf, service_types = await self.context.get_shared_context(project_id,
+        #                                                                                                token)
+        context_blocks, _ = await self.context.aggregate_blocks_layer_context(
+            params.scenario_id,
+            params.context_func_zone_source,
+            params.context_func_source_year,
+            token,
+        )
+        EFFECTS_TERRITORY_TRANSFORMATION_TOTAL.inc()
+        start_time = time.perf_counter()
+        try:
+            return await self.territory_transformation_scenario_before(token, params, context_blocks)
+        except Exception:
+            EFFECTS_TERRITORY_TRANSFORMATION_ERROR_TOTAL.inc()
+            raise
+        finally:
+            EFFECTS_TERRITORY_TRANSFORMATION_DURATION_SECONDS.observe(
+                time.perf_counter() - start_time
+            )
+
+    async def values_transformation(
+        self,
+        token: str,
+        params: TerritoryTransformationDTO,
+    ) -> dict:
+        EFFECTS_VALUES_TRANSFORMATION_TOTAL.inc()
+        start_time = time.perf_counter()
+        try:
+            start_time = time.perf_counter()
+
+            opt_method = "territory_transformation_opt"
+
+            params = await self.get_optimal_func_zone_data(params, token)
+
+            params_for_hash = await self.build_hash_params(params, token)
+            phash = self.cache.params_hash(params_for_hash)
+            force = getattr(params, "force", False)
+
+            info = await self.urban_api_client.get_scenario_info(params.scenario_id, token)
+            updated_at = info["updated_at"]
+
+            context_blocks, _ = await self.context.aggregate_blocks_layer_context(
+                params.scenario_id,
+                params.context_func_zone_source,
+                params.context_func_source_year,
+                token,
+            )
+
+            opt_cached = (
+                None if force else self.cache.load(opt_method, params.scenario_id, phash)
+            )
+            need_refresh = (
+                force
+                or not opt_cached
+                or opt_cached["meta"]["scenario_updated_at"] != updated_at
+                or "best_x" not in opt_cached["data"]
+            )
+            if need_refresh:
+                res = await self.territory_transformation_scenario_after(
+                    token, params, context_blocks, save_cache=False
+                )
+                best_x_val = res["best_x"]
+
+                self.cache.save(
+                    opt_method,
+                    params.scenario_id,
+                    params_for_hash,
+                    {"best_x": best_x_val},
+                    scenario_updated_at=updated_at,
+                )
+                opt_cached = self.cache.load(opt_method, params.scenario_id, phash)
+
+            best_x = opt_cached["data"]["best_x"]
+
+            scenario_blocks, _ = await self.scenario.aggregate_blocks_layer_scenario(
+                params.scenario_id,
+                params.proj_func_zone_source,
+                params.proj_func_source_year,
+                token,
+            )
+
+            after_blocks = pd.concat([context_blocks, scenario_blocks], ignore_index=False)
+            if "block_id" in after_blocks.columns:
+                after_blocks["block_id"] = after_blocks["block_id"].astype(int)
+                if after_blocks.index.name == "block_id":
+                    after_blocks = after_blocks.reset_index(drop=True)
+                after_blocks = (
+                    after_blocks.drop_duplicates(subset="block_id", keep="last")
+                    .set_index("block_id")
+                    .sort_index()
+                )
+            else:
+                after_blocks.index = after_blocks.index.astype(int)
+                after_blocks = after_blocks[
+                    ~after_blocks.index.duplicated(keep="last")
+                ].sort_index()
+            after_blocks.index.name = "block_id"
+
+            if "is_project" in after_blocks.columns:
+                after_blocks["is_project"] = (
+                    after_blocks["is_project"].fillna(False).astype(bool)
+                )
+            else:
+                after_blocks["is_project"] = False
+
+            try:
+                acc_mx = get_accessibility_matrix(after_blocks)
+            except Exception as e:
+                logger.exception("Accessibility matrix calculation failed")
+                raise http_exception(
+                    500, "Accessibility matrix calculation failed", _detail=str(e)
+                )
+
+            service_types = await self.urban_api_client.get_service_types()
+            service_types = await adapt_service_types(service_types, self.urban_api_client)
+            service_types = service_types[
+                ~service_types["infrastructure_type"].isna()
+            ].copy()
+            service_types["infrastructure_weight"] = (
+                service_types["infrastructure_type"].map(INFRASTRUCTURES_WEIGHTS)
+                * service_types["infrastructure_weight"]
+            )
+
+            facade = self._build_facade(after_blocks, acc_mx, service_types)
+            test_blocks: gpd.GeoDataFrame = after_blocks.loc[
+                list(facade._blocks_lu.keys())
+            ].copy()
+            test_blocks.index = test_blocks.index.astype(int)
+
+            try:
+                solution_df = facade.solution_to_services_df(best_x).copy()
+            except Exception as e:
+                logger.exception("Solution calculation failed")
+                raise http_exception(500, "Solution calculation failed", _detail=str(e))
+
+            solution_df["block_id"] = solution_df["block_id"].astype(int)
+            metrics = [
+                c
+                for c in ["site_area", "build_floor_area", "capacity", "count"]
+                if c in solution_df.columns
+            ]
+
+            if metrics:
+                non_zero_mask = (solution_df[metrics].fillna(0) != 0).any(axis=1)
+                solution_df = solution_df[non_zero_mask].copy()
+
+            if len(metrics):
+                agg = (
+                    solution_df.groupby(["block_id", "service_type"])[metrics]
+                    .sum()
+                    .sort_index()
+                )
+            else:
+                agg = (
+                    solution_df.groupby(["block_id", "service_type"])
+                    .size()
+                    .to_frame(name="__dummy__")
+                    .drop(columns="__dummy__")
+                )
+
+            def _row_to_dict(s: pd.Series) -> dict:
+                d = {m: (0 if pd.isna(s.get(m)) else s.get(m)) for m in metrics}
+                for k, v in d.items():
+                    try:
+                        fv = float(v)
+                        d[k] = int(fv) if fv.is_integer() else fv
+                    except Exception:
+                        pass
+                return d
+
+            cells = (
+                agg.apply(_row_to_dict, axis=1)
+                if len(metrics)
+                else agg.apply(lambda _: {}, axis=1)
+            )
+            wide = cells.unstack("service_type").reindex(index=test_blocks.index)
+
+            all_services = sorted(solution_df["service_type"].dropna().unique().tolist())
+            for s in all_services:
+                if s not in wide.columns:
+                    wide[s] = np.nan
+
+            cells = (
+                agg.apply(_row_to_dict, axis=1)
+                if len(metrics)
+                else agg.apply(lambda _: {}, axis=1)
+            )
+            wide = cells.unstack("service_type").reindex(index=test_blocks.index)
+
+            all_services = sorted(solution_df["service_type"].dropna().unique().tolist())
+            for s in all_services:
+                if s not in wide.columns:
+                    wide[s] = np.nan
+
+            wide = wide[all_services]
+            test_blocks_with_services: gpd.GeoDataFrame = test_blocks.join(wide, how="left")
+
+            logger.info("Values transformed complete")
+
+            geom_col = test_blocks_with_services.geometry.name
+            service_cols = all_services
+            base_cols = [
+                c for c in ["is_project"] if c in test_blocks_with_services.columns
+            ]
+
+            gdf_out = test_blocks_with_services[base_cols + service_cols + [geom_col]]
+
+            try:
+                logger.info("Running land-use prediction on 'after_blocks'")
+
+                ab = after_blocks[
+                    after_blocks.geometry.notna() & ~after_blocks.geometry.is_empty
+                ].copy()
+                ab.geometry = ab.geometry.buffer(0)
+
+                try:
+                    utm_crs = ab.estimate_utm_crs()
+                    ab = ab.to_crs(utm_crs)
+                except Exception:
+                    ab = ab.to_crs("EPSG:3857")
+
+                clf = SpatialClassifier.default()
+                lu = clf.run(ab)
+
+                lu = lu.drop(columns=["category"], errors="ignore")
+
+                keep_cols = ["pred_name", "prob_urban", "prob_non_urban", "prob_industrial"]
+                for c in keep_cols:
+                    if c not in lu.columns:
+                        lu[c] = np.nan
+                lu = lu[keep_cols]
+
+                lu = _ensure_block_index(lu)
+                gdf_out = _ensure_block_index(gdf_out)
+                gdf_out = gdf_out.join(lu, how="left")
+
+                logger.info(
+                    "Attached land-use predictions to gdf_out (cols: {})", keep_cols
+                )
+
+                if "pred_name" in gdf_out.columns:
+                    gdf_out["Предсказанный вид использования"] = (
+                        gdf_out["pred_name"]
+                        .str.lower()
+                        .map(PRED_VALUE_RU)
+                        .fillna(gdf_out["pred_name"])
+                    )
+                    gdf_out = gdf_out.drop(columns=["pred_name"])
+
+                prob_cols = [
+                    c
+                    for c in ["prob_urban", "prob_non_urban", "prob_industrial"]
+                    if c in gdf_out.columns
+                ]
+                for col in prob_cols:
+                    gdf_out[col] = gdf_out[col].astype(float).round(1)
+
+                rename_map = {
+                    k: v for k, v in PROB_COLS_EN_TO_RU.items() if k in gdf_out.columns
+                }
+                gdf_out = gdf_out.rename(columns=rename_map)
+
+            except Exception as e:
+                raise http_exception(500, "Failed to attach land-use predictions: {}", e)
+
+            gdf_out = gdf_out.to_crs("EPSG:4326")
+            gdf_out.geometry = round_coords(gdf_out.geometry, 6)
+
+            service_types = await self.urban_api_client.get_service_types()
+            try:
+                en2ru = await build_en_to_ru_map(service_types)
+                rename_map = {k: v for k, v in en2ru.items() if k in gdf_out.columns}
+                if rename_map:
+                    gdf_out = gdf_out.rename(columns=rename_map)
+
+                geom_col = gdf_out.geometry.name
+                non_geom = [c for c in gdf_out.columns if c != geom_col]
+
+                pin_first = [
+                    c
+                    for c in ["is_project", "Предсказанный вид использования"]
+                    if c in non_geom
+                ]
+
+                rest = [c for c in non_geom if c not in pin_first]
+                rest_sorted = sorted(rest, key=lambda s: s.casefold())
+
+                gdf_out = gdf_out[pin_first + rest_sorted + [geom_col]]
+
+                geojson = json.loads(gdf_out.to_json())
+            except Exception as e:
+                logger.exception("Failed to attach land-use predictions to gdf_out")
+                raise http_exception(500, "Failed to attach land-use predictions", e)
+
+            self.cache.save(
+                "values_transformation",
+                params.scenario_id,
+                params_for_hash,
+                geojson,
+                scenario_updated_at=updated_at,
+            )
+
+            logger.info("Values transformed complete (with land-use predictions)")
+            return geojson
+        except Exception:
+            EFFECTS_VALUES_TRANSFORMATION_ERROR_TOTAL.inc()
+            raise
+        finally:
+            EFFECTS_VALUES_TRANSFORMATION_DURATION_SECONDS.observe(time.perf_counter() - start_time)
+
+    def _get_value_level(self, provisions: list[float | None]) -> float:
+        vals = [p for p in provisions if p is not None]
+        return float(np.mean(vals)) if vals else np.nan
+
+    async def values_oriented_requirements(
+        self,
+        token: str,
+        params: TerritoryTransformationDTO | DevelopmentDTO,
+        persist: Literal["full", "table_only"] = "full",
+    ):
+        EFFECTS_VALUES_ORIENTED_REQUIREMENTS_TOTAL.inc()
+        start_time = time.perf_counter()
+        try:
+            method_name = "values_oriented_requirements"
+
+            force: bool = bool(getattr(params, "force", False))
+
+            base_id = await self.effects_utils.resolve_base_id(token, params.scenario_id)
+            logger.info(
+                f"Using base scenario_id={base_id} (requested={params.scenario_id})"
+            )
+
+            params_base = params.model_copy(
+                update={
+                    "scenario_id": base_id,
+                    "proj_func_zone_source": None,
+                    "proj_func_source_year": None,
+                    "context_func_zone_source": None,
+                    "context_func_source_year": None,
+                }
+            )
+            params_base = await self.get_optimal_func_zone_data(params_base, token)
+
+            params_for_hash_base = await self.build_hash_params(params_base, token)
+            phash_base = self.cache.params_hash(params_for_hash_base)
+            info_base = await self.urban_api_client.get_scenario_info(base_id, token)
+            updated_at_base = info_base["updated_at"]
+
+            def _result_to_df(payload: Any) -> pd.DataFrame:
+                if isinstance(payload, dict) and "data" not in payload:
+                    items = sorted(
+                        ((int(k), v.get("value", 0.0)) for k, v in payload.items()),
+                        key=lambda t: t[0],
+                    )
+                    idx = [k for k, _ in items]
+                    vals = [float(v) if v is not None else 0.0 for _, v in items]
+                    return pd.DataFrame({"social_value_level": vals}, index=idx)
+                df = pd.DataFrame(
+                    data=payload["data"], index=payload["index"], columns=payload["columns"]
+                )
+                df.index.name = payload.get("index_name", None)
+                return df
+
+            if not force:
+                cached_base = self.cache.load(method_name, base_id, phash_base)
+                if (
+                    cached_base
+                    and cached_base["meta"].get("scenario_updated_at") == updated_at_base
+                    and "result" in cached_base["data"]
+                ):
+                    return _result_to_df(cached_base["data"]["result"])
+
+            context_blocks, _ = await self.context.aggregate_blocks_layer_context(
+                params.scenario_id,
+                params_base.context_func_zone_source,
+                params_base.context_func_source_year,
+                token,
+            )
+
+            scenario_blocks, _ = await self.scenario.aggregate_blocks_layer_scenario(
+                params_base.scenario_id,
+                params_base.proj_func_zone_source,
+                params_base.proj_func_source_year,
+                token,
+            )
+            scenario_blocks = scenario_blocks.to_crs(context_blocks.crs)
+
+            cap_cols = [c for c in scenario_blocks.columns if c.startswith("capacity_")]
+            scenario_blocks.loc[
+                scenario_blocks["is_project"], ["population"] + cap_cols
+            ] = 0
+            if "capacity" in scenario_blocks.columns:
+                scenario_blocks = scenario_blocks.drop(columns="capacity")
+
+            blocks = gpd.GeoDataFrame(
+                pd.concat([context_blocks, scenario_blocks], ignore_index=True),
+                crs=context_blocks.crs,
+            )
+
+            service_types = await self.urban_api_client.get_service_types()
+            service_types = await adapt_service_types(service_types, self.urban_api_client)
+            service_types = service_types[~service_types["social_values"].isna()].copy()
+
+            try:
+                acc_mx = get_accessibility_matrix(blocks)
+            except Exception as e:
+                logger.exception("Accessibility matrix calculation failed")
+                raise http_exception(
+                    500, "Accessibility matrix calculation failed", _detail=str(e)
+                )
+
+            prov_gdfs: Dict[str, gpd.GeoDataFrame] = {}
+            for st_id in service_types.index:
+                st_name = service_types.loc[st_id, "name"]
+                prov_gdf = await self._assess_provision(blocks, acc_mx, st_name)
+                prov_gdf = prov_gdf.to_crs(4326).drop(
+                    columns="provision_weak", errors="ignore"
+                )
+                num_cols = prov_gdf.select_dtypes(include="number").columns
+                prov_gdf[num_cols] = prov_gdf[num_cols].fillna(0)
+                prov_gdfs[st_name] = prov_gdf
+
+            social_values_provisions: Dict[str, list[float | None]] = {}
+            for st_id in service_types.index:
+                st_name = service_types.loc[st_id, "name"]
+                social_values = service_types.loc[st_id, "social_values"]
+                prov_gdf = prov_gdfs.get(st_name)
+                if prov_gdf is None or prov_gdf.empty:
+                    continue
+                prov_total = (
+                    None
+                    if prov_gdf["demand"].sum() == 0
+                    else float(provision_strong_total(prov_gdf))
+                )
+                for sv in social_values:
+                    social_values_provisions.setdefault(sv, []).append(prov_total)
+
+            soc_values_map = await self.urban_api_client.get_social_values_info()
+            index = list(social_values_provisions.keys())
+            result_df = pd.DataFrame(
+                data=[self._get_value_level(social_values_provisions[sv]) for sv in index],
+                index=index,
+                columns=["social_value_level"],
+            )
+            values_table = {
+                int(sv_id): {
+                    "name": soc_values_map.get(sv_id, str(sv_id)),
+                    "value": round(float(val), 2) if val else 0.0,
+                }
+                for sv_id, val in result_df["social_value_level"].to_dict().items()
+            }
+
+            raw_services_df = await self.urban_api_client.get_service_types()
+            en2ru = await build_en_to_ru_map(raw_services_df)
+
+            demand_left_col = "demand_left"
+            social_values_table: list[dict] = []
+
+            for st_id in service_types.index:
+                st_en = service_types.loc[st_id, "name"]
+                st_ru = en2ru.get(st_en, st_en)
+
+                linked_ids = list(
+                    map(int, (service_types.loc[st_id, "social_values"] or []))
+                )
+                linked_ru = [soc_values_map.get(sv_id, str(sv_id)) for sv_id in linked_ids]
+
+                gdf = prov_gdfs.get(st_en)
+                total_unsatisfied = 0.0
+                if gdf is not None and not gdf.empty:
+                    if demand_left_col not in gdf.columns:
+                        raise RuntimeError(
+                            f"Колонка '{demand_left_col}' отсутствует для сервиса '{st_en}'"
+                        )
+                    total_unsatisfied = float(gdf[demand_left_col].sum())
+
+                social_values_table.append(
+                    {
+                        "service": st_ru,
+                        "unsatisfied_demand_sum": round(total_unsatisfied, 2),
+                        "social_values": linked_ru,
+                    }
+                )
+
+            if persist == "full":
+                payload = {
+                    "provision": {
+                        name: await gdf_to_ru_fc_rounded(gdf, ndigits=6)
+                        for name, gdf in prov_gdfs.items()
+                    },
+                    "result": values_table,
+                    "social_values_table": social_values_table,
+                    "services_type_deficit": social_values_table,
+                }
+            else:
+                payload = {
+                    "result": values_table,
+                    "social_values_table": social_values_table,
+                    "services_type_deficit": social_values_table,
+                }
+
+            self.cache.save(
+                method_name,
+                base_id,
+                params_for_hash_base,
+                payload,
+                scenario_updated_at=updated_at_base,
+            )
+
+            return result_df
+        except Exception:
+            EFFECTS_VALUES_ORIENTED_REQUIREMENTS_ERROR_TOTAL.inc()
+            raise
+        finally:
+            EFFECTS_VALUES_ORIENTED_REQUIREMENTS_DURATION_SECONDS.observe(time.perf_counter() - start_time)
+
+    def _clean_number(self, v):
+        """
+        Normalize numeric-like values to built-in Python types.
+
+        Converts numpy numeric types (e.g. np.int64, np.float32) to plain `int` or `float`,
+        safely handling `None`, `NaN`, and infinite values.
+
+        Returns:
+            int | float | Any | None:
+                - int or float for finite numeric inputs
+                - None for NaN, None, or ±inf
+                - unchanged value for non-numeric inputs
+        """
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return None
+        try:
+            if isinstance(v, (np.floating, float, np.integer, int)) and not np.isfinite(
+                float(v)
+            ):
+                return None
+        except Exception:
+            pass
+        if isinstance(v, np.integer):
+            return int(v)
+        if isinstance(v, np.floating):
+            return float(v)
+        return v
+
+    def _format_indicator_label(self, ind_info: dict[str, Any]) -> str:
+        """Build display label: 'name_full (unit)' if measurement_unit exists."""
+        name = (ind_info.get("name_full") or "").strip()
+        if not name:
+            name = (ind_info.get("name_short") or "").strip()
+
+        mu = ind_info.get("measurement_unit") or {}
+        unit = (mu.get("name") or "").strip()
+
+        return f"{name} ({unit})" if unit else name
+
+    async def _load_indicator_name_cache(self) -> dict[int, str]:
+        """Load indicator_id -> formatted label mapping once, based on INDICATORS_MAPPING."""
+        if self._indicator_name_cache:
+            return self._indicator_name_cache
+
+        async with self._indicator_name_cache_lock:
+            if self._indicator_name_cache:
+                return self._indicator_name_cache
+
+            indicator_ids: set[int] = set()
+            for v in INDICATORS_MAPPING.values():
+                if v is None:
+                    continue
+                try:
+                    indicator_ids.add(int(v))
+                except (TypeError, ValueError):
+                    logger.warning("Skipping invalid indicator id in INDICATORS_MAPPING: %r", v)
+
+            logger.info(f"Preloading indicator names for {len(indicator_ids)} indicators")
+
+            id_to_name: dict[int, str] = {}
+            for ind_id in sorted(indicator_ids):
+                try:
+                    ind_info = await self.urban_api_client.get_indicator_info(ind_id)
+                    id_to_name[ind_id] = self._format_indicator_label(ind_info)
+                except Exception as exc:
+                    logger.warning(f"Failed to fetch indicator info for id={ind_id}: {exc}")
+
+            self._indicator_name_cache = id_to_name
+            logger.info(f"Indicator name cache loaded: {len(self._indicator_name_cache)} entries")
+            return self._indicator_name_cache
+
+    async def _load_urbanomy_indicator_name_cache(self) -> dict[int, str]:
+        """Load Urbanomy indicator_id -> formatted label mapping once."""
+        async with self._urbanomy_indicator_name_cache_lock:
+            if self._urbanomy_indicator_name_cache:
+                return self._urbanomy_indicator_name_cache
+
+            indicator_ids = {int(v) for v in URBANOMY_INDICATORS_MAPPING.values() if v is not None}
+            logger.info(f"Preloading Urbanomy indicator names for {len(indicator_ids)} indicators")
+
+            id_to_name: dict[int, str] = {}
+            for ind_id in sorted(indicator_ids):
+                try:
+                    ind_info = await self.urban_api_client.get_indicator_info(ind_id)
+                    id_to_name[ind_id] = self._format_indicator_label(ind_info)
+                except Exception as exc:
+                    logger.warning(f"Failed to fetch Urbanomy indicator info for id={ind_id}: {exc}")
+
+            self._urbanomy_indicator_name_cache = id_to_name
+            logger.info(
+                f"Urbanomy indicator name cache loaded: {len(self._urbanomy_indicator_name_cache)} entries"
+            )
+            return self._urbanomy_indicator_name_cache
+
+    async def _attach_urbanomy_indicator_names(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Attach Urbanomy indicator full names based on numeric indicator_id."""
+        if df.empty or "indicator_id" not in df.columns:
+            logger.warning("Urbanomy df is empty or has no 'indicator_id' column")
+            return df
+
+        df = df.copy()
+        id_to_name = await self._load_urbanomy_indicator_name_cache()
+        if not id_to_name:
+            logger.warning("Urbanomy indicator name cache is empty, leaving df as is")
+            return df
+
+        def _map_name(v: Any) -> str | None:
+            if pd.isna(v):
+                return None
+            try:
+                return id_to_name.get(int(v))
+            except (TypeError, ValueError):
+                return None
+
+        df["indicator_name"] = df["indicator_id"].astype("float64").map(_map_name)
+        before = len(df)
+        df = df[df["indicator_name"].notna()].copy()
+        logger.info(
+            f"Attached Urbanomy indicator names for {len(df)} rows (filtered out {before - len(df)} rows without names)"
+        )
+        return df
+
+    async def _attach_indicator_names(
+            self,
+            df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Attach indicator full names based on numeric indicator_id.
+
+        Expects column 'indicator_id' with numeric IDs.
+        """
+        if df.empty or "indicator_id" not in df.columns:
+            logger.warning("DataFrame is empty or has no 'indicator_id' column")
+            return df
+
+        df = df.copy()
+
+        id_to_name = await self._load_indicator_name_cache()
+        if not id_to_name:
+            logger.warning("Indicator name cache is empty, leaving dataframe as is")
+            return df
+
+        def _map_name(v: Any) -> str | None:
+            if pd.isna(v):
+                return None
+            try:
+                return id_to_name.get(int(v))
+            except (TypeError, ValueError):
+                return None
+
+        df["indicator_name"] = (
+            df["indicator_id"]
+            .astype("float64")
+            .map(_map_name)
+        )
+
+        before = len(df)
+        df = df[df["indicator_name"].notna()].copy()
+        logger.info(
+            f"Attached indicator names for {len(df)} rows (filtered out {before - len(df)} rows without names)"
+        )
+
+        return df
+
+    async def _get_land_price_model(self) -> CatBoostRegressor:
+        """Load CatBoost model once and reuse it."""
+        async with self._land_price_model_lock:
+            if self._land_price_model is not None:
+                return self._land_price_model
+
+            path = Path(self._catboost_model_path)
+            if not path.exists():
+                raise FileNotFoundError(f"CatBoost model not found at: {path}")
+
+            model = CatBoostRegressor()
+            await asyncio.to_thread(model.load_model, str(path))
+
+            self._land_price_model = model
+            logger.info("CatBoost land price model loaded")
+            return model
+
+    async def _fetch_land_use_potentials(self, scenario_id: int, token: str) -> pd.DataFrame:
+        scenario_indicators = await self.urban_api_client.get_indicator_scenario_value(scenario_id, token)
+
+        indicator_attributes = {
+            (item.get("indicator") or {}).get("name_full"): item.get("value")
+            for item in scenario_indicators
+        }
+
+        records: list[dict[str, object]] = []
+        for indicator_name, land_use in URBANOMY_LAND_USE_RULES.items():
+            potential = indicator_attributes.get(indicator_name)
+            if potential is None:
+                continue
+            records.append({"land_use": land_use, "potential": potential})
+
+        return pd.DataFrame(records).reset_index(drop=True)
+
+    async def _compute_for_single_scenario(
+        self,
+        scenario_id: int,
+        context_blocks: gpd.GeoDataFrame,
+        context_territories_gdf: gpd.GeoDataFrame,
+        service_types_df: pd.DataFrame,
+        proj_src: str,
+        proj_year: int,
+        token: str,
+        only_parent_ids: set[int] | None = None,
+    ) -> list[dict]:
+        """
+        Compute indicators for ONE scenario with shared context.
+        Returns JSON-serializable list of records: [{territory_id, indicator_id, value}, ...]
+        """
+        logger.info(f"Computing indicators for scenario_id={scenario_id}")
+
+        scenario_blocks, _ = await self.scenario.aggregate_blocks_layer_scenario(
+            scenario_id, proj_src, proj_year, token
+        )
+        before_blocks = pd.concat([context_blocks, scenario_blocks], ignore_index=True)
+
+        svc_cols = [
+            c for c in before_blocks.columns if c.startswith(("count_", "capacity_"))
+        ]
+        if svc_cols:
+            before_blocks[svc_cols] = (
+                before_blocks[svc_cols]
+                .apply(pd.to_numeric, errors="coerce")
+                .fillna(0)
+                .astype("int64")
+            )
+
+        context_territories_gdf = context_territories_gdf.to_crs(before_blocks.crs)
+        try:
+            assigned = assign_objects(
+                before_blocks,
+                context_territories_gdf.rename(columns={"parent": "name"}),
+            )
+        except Exception as e:
+            logger.exception("Error assigning objects")
+            raise http_exception(500, "Error assigning objects", _detail=str(e))
+        before_blocks["parent"] = assigned["name"].astype(int)
+
+        if only_parent_ids:
+            before_blocks = before_blocks[
+                before_blocks["parent"].isin(only_parent_ids)
+            ].copy()
+
+        before_blocks = generate_blocksnet_columns(before_blocks, service_types_df)
+        before_blocks = ensure_missing_id_and_name_columns(before_blocks)
+        if "population" in before_blocks.columns:
+            s = pd.to_numeric(before_blocks["population"], errors="coerce").fillna(0)
+            if pd.api.types.is_float_dtype(s):
+                s = s.round()
+            before_blocks["population"] = s.astype("int64")
+        else:
+            before_blocks["population"] = 0
+
+        roads_gdf = await self.urban_api_client.get_physical_objects_scenario(
+            scenario_id, token=token, physical_object_function_id=ROADS_ID
+        )
+        if roads_gdf is not None and not roads_gdf.empty:
+            roads_gdf = roads_gdf.to_crs(before_blocks.crs).overlay(before_blocks)
+        else:
+            roads_gdf = gpd.GeoDataFrame(geometry=[], crs=before_blocks.crs)
+
+        try:
+            acc_mx = get_accessibility_matrix(before_blocks)
+        except Exception as e:
+            logger.exception("Accessibility matrix calculation failed")
+            raise http_exception(
+                500, "Accessibility matrix calculation failed", _detail=str(e)
+            )
+        dist_mx = calculate_distance_matrix(before_blocks)
+
+        st_for_social = service_types_df[
+            service_types_df["infrastructure_type"].notna()
+            & service_types_df["blocksnet"].notna()
+        ].copy()
+
+        general = calculate_general_indicators(before_blocks)
+        demo = calculate_demographic_indicators(before_blocks)
+        eng = calculate_engineering_indicators(before_blocks)
+        sc, sp = calculate_social_indicators(
+            before_blocks, acc_mx, dist_mx, st_for_social
+        )
+
+        frames = [general, demo, eng, sc, sp]
+
+        has_roads = (
+                roads_gdf is not None
+                and not roads_gdf.empty
+                and len(roads_gdf) > 1
+        )
+
+        if has_roads:
+            try:
+                transp = calculate_transport_indicators(
+                    before_blocks, acc_mx, roads_gdf
+                )
+                frames.append(transp)
+            except Exception as exc:
+                logger.warning(
+                    "Transport indicators skipped: %s", exc
+                )
+        else:
+            logger.info(
+                "Transport indicators skipped: roads_gdf is empty or insufficient"
+            )
+
+        indicators_df = pd.concat(frames)
+
+        long_df = (
+            indicators_df.reset_index()
+            .rename(columns={"index": "indicator"})
+            .melt(id_vars=["indicator"], var_name="territory_id", value_name="value")
+        )
+        long_df = long_df[long_df["territory_id"] != "total"].copy()
+        long_df["indicator_id"] = long_df["indicator"].map(INDICATORS_MAPPING)
+
+        long_df["territory_id"] = pd.to_numeric(
+            long_df["territory_id"], errors="coerce"
+        ).apply(self._clean_number)
+        long_df["indicator_id"] = long_df["indicator_id"].apply(self._clean_number)
+        long_df["value"] = long_df["value"].apply(self._clean_number)
+        long_df["value"] = long_df["value"].round(2)
+        long_df = long_df[
+            long_df["indicator_id"].notna() & long_df["territory_id"].notna()
+            ].fillna(0)
+
+        long_df = await self._attach_indicator_names(long_df)
+
+        territory_id_hint: int | None = None
+        if "is_project" in before_blocks.columns:
+            proj_mask = (
+                before_blocks["is_project"]
+                .infer_objects(copy=False)
+                .fillna(False)
+                .astype(bool)
+            )
+            territory_id_hint = self._pick_single_territory_id(before_blocks.loc[proj_mask, "parent"])
+
+        urbanomy_records: list[dict] = []
+        try:
+            if territory_id_hint is not None:
+                urbanomy_records = await self._compute_urbanomy_for_single_scenario(
+                    scenario_id=scenario_id,
+                    scenario_blocks=scenario_blocks,
+                    context_blocks=context_blocks,
+                    context_territories_gdf=context_territories_gdf,
+                    token=token,
+                    only_parent_ids=only_parent_ids,
+                    territory_id_hint=territory_id_hint,
+                )
+        except Exception as exc:
+            logger.warning(f"Urbanomy failed for scenario={scenario_id}: {exc}")
+
+        records = long_df[["territory_id", "indicator_name", "value"]].to_dict(orient="records")
+
+        if urbanomy_records:
+            for r in urbanomy_records:
+                records.append(
+                    {
+                        "territory_id": self._clean_number(r.get("territory_id")),
+                        "indicator_name": r.get("indicator_name"),
+                        "value": self._clean_number(r.get("value")),
+                    }
+                )
+
+        return records
+
+    def _json_safe_number(self, v: Any) -> float | int | None:
+        """Convert any numeric-like value to a JSON-safe primitive (no NaN/Inf).
+
+        Supports strings with thousand separators like '12 438 136 946' or '2\u00A0339\u00A0984'.
+        """
+        if v is None:
+            return None
+
+        if isinstance(v, np.generic):
+            v = v.item()
+
+        if isinstance(v, bool):
+            return int(v)
+
+        if isinstance(v, int):
+            return v
+
+        if isinstance(v, float):
+            return v if math.isfinite(v) else None
+
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+
+            s = re.compile(r"[\s\u00A0\u202F]").sub("", s)
+            s = s.replace(",", ".")
+            s = re.sub(r"[^0-9\.\-]+", "", s)
+
+            if s in {"", "-", ".", "-."}:
+                return None
+
+            try:
+                f = float(s)
+            except ValueError:
+                return None
+
+            return f if math.isfinite(f) else None
+
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+
+        return f if math.isfinite(f) else None
+
+    async def _pivot_results_by_territory(
+        self,
+        results: dict[int, list[dict]],
+    ) -> dict[int, dict[str, dict[int, float]]]:
+        """
+        Transform scenario-first results to territory-first pivot.
+
+        Input:
+            results: {
+                scenario_id: [
+                    {"territory_id": int, "indicator_name": str, "value": number},
+                    ...
+                ],
+                ...
+            }
+
+        Output:
+            {
+              territory_id: {
+                indicator_name: {
+                    scenario_id: value | None,
+                    ...
+                },
+                ...
+              },
+              ...
+            }
+        """
+        pivot: dict[int, dict[str, dict[int, float]]] = {}
+
+        for scenario_id, records in results.items():
+
+            for rec in records:
+                if not isinstance(rec, dict):
+                    logger.warning(
+                        f"[Effects] Skip non-dict record in scenario {scenario_id}: {rec}"
+                    )
+                    continue
+
+                try:
+                    t_id = int(rec["territory_id"])
+                    ind_name = str(rec["indicator_name"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    logger.warning(
+                        f"[Effects] Skip record without proper territory/indicator "
+                        f"in scenario {scenario_id}: {rec} ({exc})"
+                    )
+                    continue
+
+                val_raw = rec.get("value")
+                val = self._json_safe_number(val_raw)
+                if val_raw is not None and val is None:
+                    logger.warning(
+                        f"[Effects] Failed to parse value for scenario {scenario_id}, "
+                        f"territory {t_id}, indicator '{ind_name}': {val_raw}"
+                    )
+                    val = None
+
+                terr_dict = pivot.setdefault(t_id, {})
+                ind_dict = terr_dict.setdefault(ind_name, {})
+                ind_dict[int(scenario_id)] = val
+
+        logger.info(f"[Effects] Pivoted to nested format (names): {len(pivot)} territories.")
+
+        all_scenario_ids = list(results.keys())
+        if all_scenario_ids:
+            logger.info(
+                f"[Effects] Normalizing scenario coverage for {len(all_scenario_ids)} scenarios"
+            )
+            for t_id, terr_dict in pivot.items():
+                for ind_name, scenario_dict in terr_dict.items():
+                    for sid in all_scenario_ids:
+                        scenario_dict.setdefault(int(sid), None)
+
+        return pivot
+
+    def _sanitize_for_json(self, obj: Any) -> Any:
+        """Recursively replace NaN/Inf and numpy types with JSON-safe values."""
+        if isinstance(obj, dict):
+            return {k: self._sanitize_for_json(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._sanitize_for_json(v) for v in obj]
+        if isinstance(obj, tuple):
+            return [self._sanitize_for_json(v) for v in obj]
+
+        if isinstance(obj, np.generic):
+            return self._sanitize_for_json(obj.item())
+
+        if isinstance(obj, float):
+            return obj if math.isfinite(obj) else None
+
+        return obj
+
+    def _pick_single_territory_id(self, parents: pd.Series) -> int | None:
+        """Pick a single territory_id from assigned parents; prefer mode if multiple."""
+        s = pd.to_numeric(parents, errors="coerce").dropna().astype("int64")
+        if s.empty:
+            return None
+        uniq = s.unique()
+        if len(uniq) == 1:
+            return int(uniq[0])
+
+        mode = int(s.mode().iat[0])
+        logger.warning(
+            f"Multiple territory_ids detected for scenario project blocks {sorted(map(int, uniq))}. Using mode={mode}",
+        )
+        return mode
+
+    def _urbanomy_se_result_to_indicator_values(self, result: Any) -> pd.DataFrame:
+        """Normalize SEREstimator output to dataframe with columns: indicator, value."""
+        if isinstance(result, pd.DataFrame):
+            df = result.copy()
+            if "delta_total" in df.columns and "value" not in df.columns:
+                df = df.rename(columns={"delta_total": "value"})
+            if {"indicator", "value"}.issubset(df.columns):
+                return df[["indicator", "value"]].copy()
+
+            raise ValueError(f"Unsupported Urbanomy result dataframe columns: {list(df.columns)}")
+
+        if isinstance(result, dict):
+            return pd.DataFrame([{"indicator": str(k), "value": v} for k, v in result.items()])
+
+        if isinstance(result, pd.Series):
+            out = result.reset_index()
+            out.columns = ["indicator", "value"]
+            return out
+
+        raise TypeError(f"Unsupported SEREstimator result type: {type(result)!r}")
+
+    async def _compute_urbanomy_for_single_scenario(
+            self,
+            scenario_id: int,
+            scenario_blocks: gpd.GeoDataFrame,
+            context_blocks: gpd.GeoDataFrame,
+            context_territories_gdf: gpd.GeoDataFrame,
+            token: str,
+            only_parent_ids: set[int] | None = None,
+            territory_id_hint: int | None = None,
+    ) -> list[dict]:
+        """Compute Urbanomy metrics for one scenario and return records:
+        [{territory_id, indicator_id, indicator_name, value}, ...]
+        """
+        s_cols = [c for c in URBANOMY_BLOCK_COLS if c in scenario_blocks.columns]
+        c_cols = [c for c in URBANOMY_BLOCK_COLS if c in context_blocks.columns]
+        if "geometry" not in s_cols or "geometry" not in c_cols:
+            logger.warning("Urbanomy skipped: geometry column missing")
+            return []
+
+        scenario_blocks_cut = scenario_blocks[s_cols].copy()
+        context_blocks_cut = context_blocks[c_cols].copy()
+
+        preparator = LandDataPreparator(
+            scenario_blocks_source=scenario_blocks_cut,
+            context_blocks_source=context_blocks_cut,
+        )
+        prepared = await asyncio.to_thread(preparator.prepare)
+
+        model = await self._get_land_price_model()
+        estimator = LandPriceEstimator(model=model, blocks=prepared)
+        blocks_with_land_value = await asyncio.to_thread(estimator.predict)
+
+        if "is_project" in blocks_with_land_value.columns:
+            project_blocks = blocks_with_land_value.loc[blocks_with_land_value["is_project"] == True].copy()
+        else:
+            logger.warning("Urbanomy: 'is_project' column not found; using all blocks")
+            project_blocks = blocks_with_land_value.copy()
+
+        if project_blocks.empty:
+            logger.info(f"Urbanomy: no project blocks for scenario={scenario_id}")
+            return []
+
+        territory_id: int | None = None
+
+        if territory_id_hint is not None:
+            territory_id = int(territory_id_hint)
+            if only_parent_ids and territory_id not in only_parent_ids:
+                logger.info(
+                    f"Urbanomy: territory_id={territory_id} not in only_parent_ids, skipping scenario={scenario_id}")
+                return []
+        else:
+            territories = context_territories_gdf.to_crs(project_blocks.crs)
+            assigned = assign_objects(project_blocks, territories.rename(columns={"parent": "name"}))
+            project_blocks["parent"] = pd.to_numeric(assigned["name"], errors="coerce")
+
+            if only_parent_ids:
+                project_blocks = project_blocks[project_blocks["parent"].isin(only_parent_ids)].copy()
+
+            territory_id = self._pick_single_territory_id(project_blocks["parent"])
+            if territory_id is None:
+                logger.warning(f"Urbanomy: failed to detect territory_id for scenario={scenario_id}")
+                return []
+
+            project_blocks = project_blocks[project_blocks["parent"] == territory_id].copy()
+            if project_blocks.empty:
+                return []
+
+        potential_df = await self._fetch_land_use_potentials(scenario_id=scenario_id, token=token)
+
+        investment_input = prepare_investment_input(gdf=project_blocks, project_potential=potential_df)
+
+        analyzer = InvestmentAttractivenessAnalyzer(benchmarks=benchmarks_demo)
+        summary = analyzer.calculate_investment_metrics(investment_input, discount_rate=0.18)
+        scn = project_blocks[["geometry"]].join(summary)
+
+        total_pop = 0
+        if "population" in project_blocks.columns:
+            total_pop = int(pd.to_numeric(project_blocks["population"], errors="coerce").fillna(0).sum())
+
+        est = SEREstimator({"population": max(total_pop, 0) or 300_000})
+        result = est.compute(scn, pretty=True)
+
+        df = self._urbanomy_se_result_to_indicator_values(result)
+        df["indicator_id"] = df["indicator"].map(URBANOMY_INDICATORS_MAPPING)
+        df = df[df["indicator_id"].notna()].copy()
+        df["indicator_id"] = df["indicator_id"].astype("int64")
+
+        df = df[df["value"].notna()].copy()
+
+        df["territory_id"] = int(territory_id)
+        df = df.rename(columns={"indicator": "indicator_name"})
+
+        df = await self._attach_urbanomy_indicator_names(df)
+
+        return df[["territory_id", "indicator_id", "indicator_name", "value"]].to_dict(orient="records")
+
+    def _pivot_urbanomy_by_territory_and_indicator(
+            self,
+            results: dict[int, list[dict]],
+    ) -> dict[int, dict[int, dict[int, float | None]]]:
+        """Pivot scenario-first records to territory->indicator_id->scenario_id."""
+        pivot: dict[int, dict[int, dict[int, float | None]]] = {}
+
+        for scenario_id, records in results.items():
+            for rec in records:
+                try:
+                    t_id = int(rec["territory_id"])
+                    ind_id = int(rec["indicator_id"])
+                except Exception:
+                    continue
+
+
+                terr = pivot.setdefault(t_id, {})
+                ind = terr.setdefault(ind_id, {})
+                ind[int(scenario_id)] = rec.get("value")
+
+        sids = [int(s) for s in results.keys()]
+        for t_id, terr in pivot.items():
+            for ind_id, scn_map in terr.items():
+                for sid in sids:
+                    scn_map.setdefault(sid, None)
+
+        return pivot
+
+    def _filter_by_territories(self, results: dict, territory_ids: set[int] | None) -> dict:
+        """Filter cached results by territory ids if provided."""
+        if not territory_ids:
+            return results
+        return {tid: results[tid] for tid in territory_ids if tid in results}
+
+    async def evaluate_social_economical_metrics(self, token: str, params: SocioEconomicByProjectDTO):
+        """
+        Project-level multi-scenario calculation with a shared context.
+        Return: {territory_id: {indicator_name: {scenario_id: value}}}
+        """
+        EFFECTS_SOCIO_ECONOMICAL_METRICS_TOTAL.inc()
+        start_time = time.perf_counter()
+        try:
+            project_id = params.project_id
+            parent_id = params.regional_scenario_id
+            method_name = "social_economical_metrics"
+
+            requested_ids = {int(x) for x in getattr(params, "territory_ids", [])} or None
+
+            params_for_hash = {
+                "project_id": project_id,
+                "regional_scenario_id": parent_id,
+            }
+
+            if not params.force:
+                phash = self.cache.params_hash(params_for_hash)
+                cached = self.cache.load(method_name, project_id, phash)
+                if cached:
+                    logger.info(f"[Effects] cache hit for project {project_id}, parent={parent_id}")
+                    data = cached.get("data", cached)
+                    results_all = self._sanitize_for_json(data["results"])
+                    return self._filter_by_territories(results_all, requested_ids)
+            else:
+                logger.info(f"[Effects] force=True, recalculating metrics for project {project_id}, parent={parent_id}")
+
+            context_blocks, context_territories_gdf, service_types = await self.context.get_shared_context(project_id,
+                                                                                                           token)
+
+            scenarios = await self.urban_api_client.get_project_scenarios(project_id, token)
+            target = [s for s in scenarios if (s.get("parent_scenario") or {}).get("id") == parent_id]
+            logger.info(f"[Effects] matched {len(target)} scenarios in project {project_id} (parent={parent_id})")
+
+            results: dict[int, list[dict]] = {}
+
+            only_parent_ids = None
+
+            for s in target:
+                sid = int(s["scenario_id"])
+                try:
+                    proj_src, proj_year = await self.urban_api_client.get_optimal_func_zone_request_data(
+                        token=token,
+                        data_id=sid,
+                        source=None,
+                        year=None,
+                        project=True,
+                    )
+
+                    records = await self._compute_for_single_scenario(
+                        sid,
+                        context_blocks=context_blocks,
+                        context_territories_gdf=context_territories_gdf,
+                        service_types_df=service_types,
+                        proj_src=proj_src,
+                        proj_year=proj_year,
+                        token=token,
+                        only_parent_ids=only_parent_ids,
+                    )
+                    results[sid] = records
+                except Exception:
+                    logger.error(f"[Effects] Scenario {sid} failed during socio-economic computation")
+                    results[sid] = []
+
+            results_all = await self._pivot_results_by_territory(results)
+            results_all = self._sanitize_for_json(results_all)
+
+            project_info = await self.urban_api_client.get_project(project_id, token)
+            updated_at = project_info.get("updated_at")
+
+            self.cache.save(
+                method_name,
+                project_id,
+                params_for_hash,
+                {"results": results_all},
+                scenario_updated_at=updated_at,
+            )
+
+            logger.success(f"[Effects] socio-economic metrics cached for project_id={project_id}, parent={parent_id}")
+            return self._filter_by_territories(results_all, requested_ids)
+        except Exception:
+            EFFECTS_SOCIO_ECONOMICAL_METRICS_ERROR_TOTAL.inc()
+            raise
+        finally:
+            EFFECTS_SOCIO_ECONOMICAL_METRICS_DURATION_SECONDS.observe(time.perf_counter() - start_time)
+

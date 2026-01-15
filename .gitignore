@@ -84,6 +84,7 @@ target/
 # IPython
 profile_default/
 ipython_config.py
+*.ipynb
 
 # pyenv
 #   For a library or package, you might want to ignore these files since the code is
@@ -125,8 +126,7 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-app/.env.development
-.env.development
+.env.*
 .venv
 env/
 venv/
@@ -171,3 +171,4 @@ gdf_with_obj.geojson
 boundaries.parquet
 roads.parquet
 water.parquet
+__effects_cache__
